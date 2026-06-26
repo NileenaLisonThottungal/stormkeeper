@@ -202,18 +202,3 @@ Gym-style interface so the RL loop is decoupled from game internals.
 
 ---
 
-## CV bullet
-
-> **Stormkeeper** (2025) — Designed and implemented a reproducible stochastic
-> environment for reinforcement learning research entirely in the browser, with
-> no external dependencies. The environment models seasonal weather via an
-> Ornstein-Uhlenbeck process with per-season parameters, uses a semi-implicit
-> Euler integrator for unconditional stability at coarse training timesteps, and
-> exposes a Gym-compatible `reset`/`step` interface with a 47-dimensional
-> observation space and 32 discrete actions. Trained a REINFORCE policy-gradient
-> agent with a hand-written Adam optimiser and single hidden layer; documented
-> convergence behaviour honestly, including the known reward-hacking pattern
-> where the agent ignores plant harvesting in favour of the denser survival
-> signal. All stochastic elements are seeded with mulberry32 for exact
-> reproducibility. Tests cover RNG determinism, OU stationary statistics,
-> spatial-hash correctness, and the full Gym interface.
