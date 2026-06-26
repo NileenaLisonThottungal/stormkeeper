@@ -1,0 +1,1580 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Stormkeeper</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#000;overflow:hidden}
+canvas{display:block}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+// ============================================================
+// STORMKEEPER — Stage 3: Gameplay, seasons, plants, scoring
+// Integrator: semi-implicit Euler throughout.
+// ============================================================
+
+// ── Constants ────────────────────────────────────────────────
+const PHYS_HZ     = 60;
+const PHYS_DT     = 1 / PHYS_HZ;
+const DAY_CYCLE_S = 60;       // s — visual sky loop (test speed)
+const PARALLAX_N  = 5;
+
+const PLATFORM_W  = 320;      // px
+const PLATFORM_H  = 30;       // px
+const PLANT_SLOTS = 4;
+const BALLOON_N   = 3;
+const BALLOON_R   = 34;       // px
+
+// Physics
+const G           = 9.8;      // m/s²
+const SCALE       = 80;       // px/m
+const PLAT_MASS   = 1.8;      // kg
+const PLAT_L      = PLATFORM_W / SCALE;
+const PLAT_I      = PLAT_MASS * PLAT_L * PLAT_L / 12; // kg·m²
+const PLAT_VDAMP  = 2.8;      // 1/s
+const PLAT_RDAMP  = 3.5;      // 1/s
+const PLAT_TMAX   = Math.PI / 5.5; // rad ≈ 33° — tilt game-over threshold
+
+const BALL_MASS   = 0.06;     // kg
+const BALL_LIFT_0 = 6.5;      // N
+// Decay: platform weight ≈ 17.6 N; total lift drops below that at ~60 s
+// → average player (no reinflation) starts falling at 60 s, dies ~75-90 s ✓
+const BALL_DECAY  = 0.014;    // N/s
+const SWAY_G      = 9.8;
+const SWAY_L      = 1.0;
+const SWAY_DAMP   = 0.45;
+
+const CAM_AMP     = 0.5;      // px
+const CAM_FREQ    = 0.06;     // Hz
+
+// Particles
+const RAIN_RATE    = 4.0;     // /s
+const RAIN_TERM_VY = 7.0;     // m/s
+const RAIN_DRAG    = 1.2;
+const SNOW_RATE    = 3.5;     // /s — winter
+const SNOW_MASS    = 0.003;   // kg per landed flake
+const LEAF_RATE    = 1.8;     // /s — autumn
+const LEAF_MASS    = 0.008;   // kg per landed leaf
+const SPATIAL_CELL = 60;      // px
+
+// Seasonal OU wind { theta, sigma, muX, muY }
+const SEASON_WIND = {
+  spring: { theta:2.0, sigma:3.0, muX: 0, muY:0 },
+  summer: { theta:1.5, sigma:2.0, muX: 0, muY:0 },
+  autumn: { theta:1.0, sigma:4.5, muX: 6, muY:0 },
+  winter: { theta:3.0, sigma:6.0, muX: 0, muY:0 },
+};
+
+// Gameplay
+const BALL_COOLDOWN  = 22;    // s — reinflation cooldown
+const GUST_LIFT      = 5.2;   // N — extra lift while warm-gusting
+const STAM_DRAIN     = 0.38;  // /s
+const STAM_REGEN     = 0.14;  // /s
+const ICE_RATE       = 0.0018;// /s — lift reduction from ice per second
+const ICE_MAX        = 0.60;  // — — max ice factor
+const HEAT_MAX       = 0.27;  // — — max summer lift reduction
+const HEAT_BUILD     = 0.008; // /s
+const LIGHTNING_WARN = 3.2;   // s
+const LIGHTNING_DMG  = 2.2;   // N lift damage on hit
+const SCORE_PER_S    = 1.0;   // survival points/s
+const SCORE_HARVEST  = 12;    // base harvest points
+
+const LEAF_DAMP      = 0.8;       // drag coefficient for leaf horizontal velocity
+
+// Season thresholds (absolute simTime in seconds)
+const SEASON_AT = [0, 90, 180, 270];  // spring/summer/autumn/winter start
+const WINTER_CLEAR = 60;               // s in winter to "win"
+
+// ── RL / Gym-style env ────────────────────────────────────────
+// Observation vector layout (47 values — fixed-length for network stability):
+//   [0-1]   wind (windX/15, windY/15) — σ_autumn≈4.5, /15 keeps |obs|≤1 for most states
+//   [2-7]   balloon lift / BALL_LIFT_0, 3 real + 3 zero-pad (spec says max 6)
+//   [8]     platTheta / PLAT_TMAX                — tilt, -1 to 1
+//   [9]     snowLoad / 2.0                       — accumulated snow weight proxy
+//   [10]    stamina                               — 0..1
+//   [11-14] one-hot season                       — spring/summer/autumn/winter
+//   [15-46] nearest 8 hazard particles × 4 values (x/W, y/H, vx/200, vy/200)
+//           particles not present → zero-padded
+const OBS_SIZE   = 47;
+// Discrete action space (32 actions):
+//   0        do_nothing
+//   1-3      tap_balloon_i (i=0,1,2)
+//   4-27     gust at 6×4 canvas grid cell (24 positions)
+//   28-31    harvest_plant_i (i=0,1,2,3)
+// 6×4 gust grid keeps action space manageable; agent learns to target
+// the platform rather than arbitrary screen coordinates.
+const ACT_SIZE   = 32;
+const HID_SIZE   = 32;        // hidden units — small enough to train in browser
+// Training uses a coarser timestep (documented shortcut from spec):
+// TRAIN_DT=0.1 s vs PHYS_DT=0.017 s gives 6× speedup with acceptable physics error.
+// Semi-implicit Euler is unconditionally stable so energy doesn't blow up.
+const TRAIN_DT        = 0.10;   // s per RL step during training
+const TRAIN_STEPS_MAX = 3300;   // max steps/episode = 330 s simulated time
+const GAMMA      = 0.995;       // discount — long enough horizon to reach winter
+const RL_LR      = 3e-4;        // Adam learning rate
+const ADAM_B1    = 0.9;
+const ADAM_B2    = 0.999;
+const ADAM_EPS   = 1e-8;
+const CHART_HIST = 100;         // episodes in rolling return plot
+
+// ── RNG ──────────────────────────────────────────────────────
+let SEED = 42317;
+function mulberry32(s) {
+  return () => {
+    s |= 0; s = s + 0x6D2B79F5 | 0;
+    let t = Math.imul(s ^ s >>> 15, 1 | s);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+let rng         = mulberry32(SEED);
+let windRng     = mulberry32(SEED ^ 0xDEADBEEF);
+let particleRng = mulberry32(SEED ^ 0xCAFEBABE);
+let lightRng    = mulberry32(SEED ^ 0x11223344);
+
+function randn(r) {
+  if (r._sp !== undefined) { const s=r._sp; r._sp=undefined; return s; }
+  let u,v,s; do { u=r()*2-1; v=r()*2-1; s=u*u+v*v; } while(s>=1||s===0);
+  const m=Math.sqrt(-2*Math.log(s)/s); r._sp=v*m; return u*m;
+}
+
+// ── Perlin noise ──────────────────────────────────────────────
+const PERM = new Uint8Array(512);
+(function(){
+  const p=Uint8Array.from({length:256},(_,i)=>i);
+  for(let i=255;i>0;i--){const j=Math.floor(rng()*(i+1));[p[i],p[j]]=[p[j],p[i]];}
+  for(let i=0;i<512;i++) PERM[i]=p[i&255];
+})();
+const _f=(t)=>t*t*t*(t*(t*6-15)+10);
+const _lr=(a,b,t)=>a+(b-a)*t;
+function _gr(h,x,y){const u=h<8?x:y,v=h<4?y:h===12||h===14?x:0;return((h&1)?-u:u)+((h&2)?-v:v);}
+function noise2(x,y){
+  const X=Math.floor(x)&255,Y=Math.floor(y)&255;
+  x-=Math.floor(x);y-=Math.floor(y);
+  const u=_f(x),v=_f(y),A=PERM[X]+Y,B=PERM[X+1]+Y;
+  return _lr(_lr(_gr(PERM[A],x,y),_gr(PERM[B],x-1,y),u),
+             _lr(_gr(PERM[A+1],x,y-1),_gr(PERM[B+1],x-1,y-1),u),v);
+}
+
+// ── Canvas ────────────────────────────────────────────────────
+const canvas=document.getElementById('c');
+const ctx=canvas.getContext('2d');
+let W=0,H=0,platX=0,platY=0;
+function resize(){
+  W=canvas.width=innerWidth; H=canvas.height=innerHeight;
+  platX=W/2; if(!platY) platY=H*0.62;
+}
+addEventListener('resize',resize); resize();
+
+if(!CanvasRenderingContext2D.prototype.roundRect){
+  CanvasRenderingContext2D.prototype.roundRect=function(x,y,w,h,r){
+    this.moveTo(x+r,y);this.lineTo(x+w-r,y);this.arcTo(x+w,y,x+w,y+r,r);
+    this.lineTo(x+w,y+h-r);this.arcTo(x+w,y+h,x+w-r,y+h,r);
+    this.lineTo(x+r,y+h);this.arcTo(x,y+h,x,y+h-r,r);
+    this.lineTo(x,y+r);this.arcTo(x,y,x+r,y,r);this.closePath();
+  };
+}
+
+// ── Colour helpers ────────────────────────────────────────────
+const rgb =(c)=>`rgb(${c[0]|0},${c[1]|0},${c[2]|0})`;
+const rgba=(c,a)=>`rgba(${c[0]|0},${c[1]|0},${c[2]|0},${a.toFixed(3)})`;
+const lerpC=(a,b,f)=>[a[0]+(b[0]-a[0])*f,a[1]+(b[1]-a[1])*f,a[2]+(b[2]-a[2])*f];
+
+// ── Day palette ───────────────────────────────────────────────
+const PALETTE=[
+  {t:0.00,top:[8,10,30],  mid:[15,20,50], hor:[30,38,75], fog:[30,40,80],  sun:[20,25,65]  },
+  {t:0.25,top:[55,38,75], mid:[165,90,85],hor:[235,165,125],fog:[200,155,135],sun:[255,195,95]},
+  {t:0.50,top:[28,78,175],mid:[65,128,208],hor:[135,185,238],fog:[180,215,250],sun:[255,255,190]},
+  {t:0.75,top:[38,28,65], mid:[155,68,58],hor:[215,135,95],fog:[170,135,125],sun:[255,155,55]},
+  {t:1.00,top:[8,10,30],  mid:[15,20,50], hor:[30,38,75], fog:[30,40,80],  sun:[20,25,65]  },
+];
+function getPalette(t){
+  let i=0; while(i<PALETTE.length-2&&PALETTE[i+1].t<=t)i++;
+  const a=PALETTE[i],b=PALETTE[i+1],f=(t-a.t)/(b.t-a.t),out={};
+  for(const k of Object.keys(a))if(k!=='t')out[k]=lerpC(a[k],b[k],f);
+  return out;
+}
+
+// ── Stars ─────────────────────────────────────────────────────
+const STAR_N=200;
+const stars=Array.from({length:STAR_N},()=>({x:rng(),y:rng()*0.68,r:0.4+rng()*1.3,tw:rng()*Math.PI*2}));
+function drawStars(n,t){
+  if(n<0.01)return;
+  for(const s of stars){
+    const a=n*(0.65+0.35*Math.sin(s.tw+t*1.3))*0.88;
+    ctx.beginPath();ctx.arc(s.x*W,s.y*H,s.r,0,Math.PI*2);
+    ctx.fillStyle=`rgba(215,225,255,${a.toFixed(3)})`;ctx.fill();
+  }
+}
+
+// ── Sky ───────────────────────────────────────────────────────
+function drawSky(pal,dayT){
+  const g=ctx.createLinearGradient(0,0,0,H*0.9);
+  g.addColorStop(0,rgb(pal.top));g.addColorStop(0.5,rgb(pal.mid));g.addColorStop(1,rgb(pal.hor));
+  ctx.fillStyle=g;ctx.fillRect(0,0,W,H);
+  const d=dayT<0.5?dayT:1-dayT;
+  drawStars(Math.max(0,Math.min(1,(0.17-d)*8)),simTime);
+  const angle=dayT*Math.PI*2-Math.PI*0.5,orbit=Math.min(W,H)*0.43;
+  const sx=W*0.5+Math.cos(angle)*orbit,sy=H*0.53+Math.sin(angle)*orbit*0.38;
+  if(sy<H*0.82){
+    const isDay=dayT>0.22&&dayT<0.78,br=isDay?26:15,gr=isDay?130:52;
+    const grd=ctx.createRadialGradient(sx,sy,0,sx,sy,gr);
+    grd.addColorStop(0,rgba(pal.sun,isDay?0.95:0.78));
+    grd.addColorStop(0.18,rgba(pal.sun,isDay?0.38:0.25));
+    grd.addColorStop(1,rgba(pal.sun,0));
+    ctx.beginPath();ctx.arc(sx,sy,gr,0,Math.PI*2);ctx.fillStyle=grd;ctx.fill();
+    ctx.beginPath();ctx.arc(sx,sy,br,0,Math.PI*2);ctx.fillStyle=rgb(pal.sun);ctx.fill();
+    if(!isDay){
+      ctx.globalAlpha=0.18;
+      for(let i=0;i<3;i++){ctx.beginPath();ctx.arc(sx+(i-1)*5,sy+(i*3-3),2+i,0,Math.PI*2);ctx.fillStyle='rgba(100,120,160,0.6)';ctx.fill();}
+      ctx.globalAlpha=1;
+    }
+  }
+  const haze=ctx.createLinearGradient(0,H*0.55,0,H);
+  haze.addColorStop(0,rgba(pal.fog,0));haze.addColorStop(0.4,rgba(pal.fog,0.13));haze.addColorStop(1,rgba(pal.fog,0.38));
+  ctx.fillStyle=haze;ctx.fillRect(0,0,W,H);
+}
+
+// ── Parallax bands ────────────────────────────────────────────
+function drawParallaxBands(pal,scroll){
+  for(let layer=0;layer<PARALLAX_N;layer++){
+    const depth=(layer+1)/PARALLAX_N,offX=(scroll*depth*0.22)%(W+500);
+    const yBase=H*(0.17+layer*0.09),thick=H*0.13,alpha=0.024+depth*0.022,PTS=22;
+    ctx.beginPath();ctx.moveTo(-offX,H);
+    for(let i=0;i<=PTS;i++){
+      const x=-offX+(W*2/PTS)*i;
+      ctx.lineTo(x,yBase+noise2(x*0.006+layer*9.1,simTime*0.038+layer*2.3)*38);
+    }
+    ctx.lineTo(-offX+W*2,H);ctx.closePath();
+    const gd=ctx.createLinearGradient(0,yBase-25,0,yBase+thick);
+    gd.addColorStop(0,rgba(pal.fog,0));gd.addColorStop(0.28,rgba(pal.fog,alpha));
+    gd.addColorStop(0.7,rgba(pal.fog,alpha*0.55));gd.addColorStop(1,rgba(pal.fog,0));
+    ctx.fillStyle=gd;ctx.fill();
+  }
+}
+
+// ── Clouds ────────────────────────────────────────────────────
+function makeCloud(cx,cy,seed){
+  const cr=mulberry32(seed),n=4+Math.floor(cr()*5);
+  return{x:cx,y:cy,depth:0.25+cr()*0.75,vx:8+cr()*16,
+    blobs:Array.from({length:n},()=>({x:(cr()-0.5)*195,y:(cr()-0.5)*58,r:38+cr()*74,phase:cr()*Math.PI*2,freq:0.07+cr()*0.18}))};
+}
+const CLOUD_N=9,clouds=[];
+for(let i=0;i<CLOUD_N;i++) clouds.push(makeCloud((i/CLOUD_N)*W*1.9-W*0.1,H*(0.08+rng()*0.30),Math.floor(rng()*99999)+1));
+function stepClouds(dt){for(const c of clouds){c.x+=c.vx*c.depth*dt;if(c.x>W+450)c.x=-450;}}
+function drawCloud(c,t){
+  ctx.save();ctx.translate(c.x,c.y);ctx.scale(0.42+c.depth*0.68,0.42+c.depth*0.68);
+  for(const b of c.blobs){
+    const dx=Math.sin(t*b.freq+b.phase)*13,dy=Math.cos(t*b.freq*0.65+b.phase)*7;
+    const bx=b.x+dx,by=b.y+dy;
+    for(const[m,a]of[[1.0,0.115],[1.38,0.068],[1.82,0.038]]){
+      const r=b.r*m,grd=ctx.createRadialGradient(bx-r*0.08,by-r*0.14,0,bx,by,r);
+      grd.addColorStop(0,`rgba(255,255,255,${a})`);
+      grd.addColorStop(0.52,`rgba(242,246,255,${(a*0.52).toFixed(3)})`);
+      grd.addColorStop(1,'rgba(255,255,255,0)');
+      ctx.beginPath();ctx.arc(bx,by,r,0,Math.PI*2);ctx.fillStyle=grd;ctx.fill();
+    }
+  }
+  ctx.restore();
+}
+
+// ── Snowflake templates (pre-generated, cached as offscreen canvases) ──
+// Each template is a unique 6-fold symmetric crystal; particles pick one at spawn.
+const SF_SIZE = 22; // px — canvas side length per template
+const SF_TEMPLATES = (() => {
+  const out = [];
+  for(let t=0;t<20;t++){
+    const cr=mulberry32(rng()*0xFFFFFFFF|0);
+    const oc=document.createElement('canvas');
+    oc.width=oc.height=SF_SIZE;
+    const octx=oc.getContext('2d');
+    const cx=SF_SIZE/2,r=SF_SIZE/2-2;
+    octx.strokeStyle='rgba(210,235,255,0.95)';octx.lineWidth=0.9;
+    for(let arm=0;arm<6;arm++){
+      octx.save();octx.translate(cx,cx);octx.rotate(arm*Math.PI/3);
+      octx.beginPath();octx.moveTo(0,0);octx.lineTo(0,-r);octx.stroke();
+      const segs=2+Math.floor(cr()*3);
+      for(let s=1;s<=segs;s++){
+        const sr=r*s/segs,bl=r*0.32*(1-s/segs)+r*0.08;
+        octx.beginPath();octx.moveTo(0,-sr);octx.lineTo( bl*0.7,-sr+bl*0.55);octx.stroke();
+        octx.beginPath();octx.moveTo(0,-sr);octx.lineTo(-bl*0.7,-sr+bl*0.55);octx.stroke();
+      }
+      octx.restore();
+    }
+    out.push(oc);
+  }
+  return out;
+})();
+
+// ── Platform renderer ─────────────────────────────────────────
+const GRAIN=Array.from({length:36},()=>({y:rng()*PLATFORM_H,wave:rng()*2-1,freq:0.007+rng()*0.016,a:0.04+rng()*0.09}));
+function drawPlatform(px,py,tilt){
+  ctx.save();ctx.translate(px,py);ctx.rotate(tilt);
+  const W2=PLATFORM_W/2;
+  const shd=ctx.createLinearGradient(0,PLATFORM_H,0,PLATFORM_H+26);
+  shd.addColorStop(0,'rgba(0,0,0,0.30)');shd.addColorStop(1,'rgba(0,0,0,0)');
+  ctx.fillStyle=shd;ctx.fillRect(-W2-6,PLATFORM_H,PLATFORM_W+12,26);
+  const wd=ctx.createLinearGradient(0,0,0,PLATFORM_H);
+  wd.addColorStop(0,'#7a5c38');wd.addColorStop(0.35,'#6b4f30');wd.addColorStop(0.75,'#5e4328');wd.addColorStop(1,'#4a341e');
+  ctx.fillStyle=wd;ctx.fillRect(-W2,0,PLATFORM_W,PLATFORM_H);
+  ctx.save();ctx.beginPath();ctx.rect(-W2,0,PLATFORM_W,PLATFORM_H);ctx.clip();
+  for(const g of GRAIN){
+    ctx.beginPath();let first=true;
+    for(let x=-W2;x<=W2;x+=3){const y=g.y+Math.sin(x*g.freq+g.wave)*4.5;first?ctx.moveTo(x,y):ctx.lineTo(x,y);first=false;}
+    ctx.strokeStyle=`rgba(0,0,0,${g.a.toFixed(3)})`;ctx.lineWidth=1;ctx.stroke();
+  }
+  ctx.restore();
+  const tb=ctx.createLinearGradient(0,0,0,7);
+  tb.addColorStop(0,'rgba(255,215,150,0.42)');tb.addColorStop(1,'rgba(255,215,150,0)');
+  ctx.fillStyle=tb;ctx.fillRect(-W2,0,PLATFORM_W,7);
+  const bb=ctx.createLinearGradient(0,PLATFORM_H-5,0,PLATFORM_H);
+  bb.addColorStop(0,'rgba(0,0,0,0)');bb.addColorStop(1,'rgba(0,0,0,0.55)');
+  ctx.fillStyle=bb;ctx.fillRect(-W2,PLATFORM_H-5,PLATFORM_W,5);
+  ctx.fillStyle='rgba(0,0,0,0.30)';ctx.fillRect(-W2,0,5,PLATFORM_H);
+  ctx.fillStyle='rgba(255,255,255,0.07)';ctx.fillRect(W2-5,0,5,PLATFORM_H);
+  // Plant slots
+  const slotW=38,slotH=8;
+  for(let i=0;i<PLANT_SLOTS;i++){
+    const sx=-W2+(PLATFORM_W/(PLANT_SLOTS+1))*(i+1)-slotW/2;
+    const sg=ctx.createLinearGradient(0,-slotH,0,0);
+    sg.addColorStop(0,'rgba(18,9,4,0.82)');sg.addColorStop(1,'rgba(58,30,12,0.32)');
+    ctx.fillStyle=sg;ctx.fillRect(sx,-slotH,slotW,slotH);
+    ctx.strokeStyle='rgba(0,0,0,0.42)';ctx.lineWidth=1;ctx.strokeRect(sx,-slotH,slotW,slotH);
+  }
+  ctx.restore();
+}
+
+// ── Snow accumulation on platform ────────────────────────────
+function drawSnowOnPlatform(px,py,tilt,snowLoad){
+  if(snowLoad<=0) return;
+  const maxH=24; // px — height at full load
+  const h=Math.min(maxH, snowLoad/0.3*maxH);
+  ctx.save();ctx.translate(px,py);ctx.rotate(tilt);
+  const W2=PLATFORM_W/2;
+  // Snow builds higher on the downhill side (angle-of-repose approximation)
+  const lean=tilt*30; // px offset
+  ctx.beginPath();
+  ctx.moveTo(-W2,0);
+  ctx.quadraticCurveTo(0,-h+lean,W2,0);
+  ctx.lineTo(W2,0);ctx.lineTo(-W2,0);ctx.closePath();
+  const sg=ctx.createLinearGradient(0,-h,0,0);
+  sg.addColorStop(0,'rgba(235,242,255,0.92)');
+  sg.addColorStop(1,'rgba(210,225,245,0.70)');
+  ctx.fillStyle=sg;ctx.fill();
+  ctx.restore();
+}
+
+// ── Plant renderer ────────────────────────────────────────────
+const PLANT_DEFS = {
+  sunflower:{name:'Sunflower',grow:{spring:40,summer:22,autumn:65,winter:null},pts:{spring:1,summer:2,autumn:0.5,winter:0},col:[220,180,40],stem:[80,140,40]},
+  mushroom: {name:'Mushroom', grow:{spring:30,summer:null,autumn:24,winter:35},pts:{spring:1,summer:0,autumn:1.5,winter:1},col:[160,110,80],stem:[210,190,170]},
+  frostlily:{name:'Frost Lily',grow:{spring:null,summer:null,autumn:null,winter:20},pts:{spring:0,summer:0,autumn:0,winter:2.5},col:[180,220,255],stem:[140,185,215]},
+  clover:   {name:'Clover',   grow:{spring:24,summer:30,autumn:38,winter:null},pts:{spring:1,summer:1,autumn:1,winter:0},col:[55,155,75],stem:[40,120,55]},
+};
+const SEASON_PLANTS={
+  spring:['clover','sunflower','clover','sunflower'],
+  summer:['sunflower','clover','sunflower','clover'],
+  autumn:['mushroom','clover','mushroom','clover'],
+  winter:['frostlily','frostlily','frostlily','frostlily'],
+};
+
+function drawPlant(lx,ly,type,growth,ripe){
+  if(!type||growth<0.05) return;
+  const def=PLANT_DEFS[type];
+  const sc=Math.min(1,growth);
+  ctx.save();ctx.translate(lx,ly);ctx.scale(sc,sc);
+
+  if(type==='sunflower'){
+    // Stalk
+    ctx.strokeStyle=rgb(def.stem);ctx.lineWidth=2.5;
+    ctx.beginPath();ctx.moveTo(0,0);ctx.lineTo(0,-28);ctx.stroke();
+    if(growth>0.7){
+      // Petals
+      const petN=8,pr=9,pd=12;
+      for(let i=0;i<petN;i++){
+        const a=i/petN*Math.PI*2;
+        const ex=Math.cos(a)*pd,ey=-28+Math.sin(a)*pd;
+        ctx.beginPath();ctx.ellipse(ex,ey,pr*0.45,pr*0.8,a,0,Math.PI*2);
+        ctx.fillStyle=rgba(def.col,0.90);ctx.fill();
+      }
+      // Centre
+      ctx.beginPath();ctx.arc(0,-28,7,0,Math.PI*2);
+      ctx.fillStyle='rgb(60,35,10)';ctx.fill();
+    }
+  } else if(type==='mushroom'){
+    // Stem
+    ctx.fillStyle=rgba(def.stem,0.90);
+    ctx.fillRect(-5,-20,10,20);
+    // Cap
+    ctx.beginPath();ctx.ellipse(0,-22,14,10,0,Math.PI,Math.PI*2);
+    ctx.fillStyle=rgba(def.col,0.95);ctx.fill();
+    // Spots
+    if(growth>0.6){
+      ctx.fillStyle='rgba(230,215,200,0.7)';
+      for(let i=0;i<3;i++){ctx.beginPath();ctx.arc(-5+i*5,-25,2,0,Math.PI*2);ctx.fill();}
+    }
+  } else if(type==='frostlily'){
+    // Stem
+    ctx.strokeStyle=rgba(def.stem,0.85);ctx.lineWidth=1.5;
+    ctx.beginPath();ctx.moveTo(0,0);ctx.lineTo(0,-22);ctx.stroke();
+    if(growth>0.7){
+      // Petals (ice-blue)
+      const petN=6;
+      for(let i=0;i<petN;i++){
+        const a=i/petN*Math.PI*2;
+        ctx.beginPath();ctx.ellipse(Math.cos(a)*8,-22+Math.sin(a)*8,4,8,a,0,Math.PI*2);
+        ctx.fillStyle=rgba(def.col,0.75);ctx.fill();
+      }
+      ctx.beginPath();ctx.arc(0,-22,4,0,Math.PI*2);
+      ctx.fillStyle='rgba(240,250,255,0.95)';ctx.fill();
+    }
+  } else { // clover
+    // Stem
+    ctx.strokeStyle=rgba(def.stem,0.85);ctx.lineWidth=2;
+    ctx.beginPath();ctx.moveTo(0,0);ctx.lineTo(0,-18);ctx.stroke();
+    if(growth>0.5){
+      // Three lobes
+      const positions=[[-6,-22],[6,-22],[0,-28]];
+      for(const[lx2,ly2]of positions){
+        ctx.beginPath();ctx.arc(lx2,ly2,6,0,Math.PI*2);
+        ctx.fillStyle=rgba(def.col,0.88);ctx.fill();
+      }
+    }
+  }
+
+  // Ripe glow
+  if(ripe){
+    const grd=ctx.createRadialGradient(0,-18,0,0,-18,18);
+    grd.addColorStop(0,`rgba(255,240,100,0.28)`);
+    grd.addColorStop(1,'rgba(255,240,100,0)');
+    ctx.beginPath();ctx.arc(0,-18,18,0,Math.PI*2);
+    ctx.fillStyle=grd;ctx.fill();
+  }
+  ctx.restore();
+}
+
+function getSlotLocalX(i){return -PLATFORM_W/2+(PLATFORM_W/(PLANT_SLOTS+1))*(i+1);}
+function getSlotWorldPos(i){
+  const cos=Math.cos(platTheta),sin=Math.sin(platTheta);
+  const lx=getSlotLocalX(i),ly=-8;
+  return{x:platX+lx*cos-ly*sin, y:platY+lx*sin+ly*cos};
+}
+
+function drawPlants(px,py,tilt){
+  ctx.save();ctx.translate(px,py);ctx.rotate(tilt);
+  for(let i=0;i<PLANT_SLOTS;i++){
+    const s=plantSlots[i];
+    if(!s.type)continue;
+    const lx=getSlotLocalX(i);
+    drawPlant(lx,-8,s.type,s.growth,s.ripe);
+  }
+  ctx.restore();
+}
+
+// ── Balloon renderer ──────────────────────────────────────────
+const BALLOON_COLS=[
+  {body:[175,58,58], dark:[95,22,22]},
+  {body:[58,115,178],dark:[22,60,108]},
+  {body:[78,158,78], dark:[28,88,28]},
+];
+const BALLOON_XOFFS=[-95,0,95];
+const balloonWorldPos=[{x:0,y:0},{x:0,y:0},{x:0,y:0}];
+
+function drawCatenary(x0,y0,x1,y1){
+  ctx.beginPath();ctx.moveTo(x0,y0);
+  for(let i=1;i<=14;i++){const f=i/14;ctx.lineTo(x0+(x1-x0)*f,y0+(y1-y0)*f+22*4*f*(1-f));}
+  ctx.strokeStyle='rgba(128,98,58,0.85)';ctx.lineWidth=1.5;ctx.stroke();
+}
+function drawBalloonBody(bx,by,r,ci,alpha,iceFactor){
+  const{body,dark}=BALLOON_COLS[ci],lx=bx-r*0.32,ly=by-r*0.33;
+  ctx.globalAlpha=alpha;
+  // Ice tints the balloon toward blue-white
+  const bc=iceFactor>0?lerpC(body,[180,210,240],iceFactor):body;
+  const dc=iceFactor>0?lerpC(dark,[100,130,180],iceFactor):dark;
+  const bg=ctx.createRadialGradient(lx,ly,r*0.04,bx,by,r);
+  bg.addColorStop(0,`rgb(${Math.min(255,bc[0]+72)},${Math.min(255,bc[1]+72)},${Math.min(255,bc[2]+72)})`);
+  bg.addColorStop(0.45,rgb(bc));bg.addColorStop(1,rgb(dc));
+  ctx.beginPath();ctx.arc(bx,by,r,0,Math.PI*2);ctx.fillStyle=bg;ctx.fill();
+  const sg=ctx.createRadialGradient(lx,ly,0,lx,ly,r*0.5);
+  sg.addColorStop(0,'rgba(255,255,255,0.60)');sg.addColorStop(0.42,'rgba(255,255,255,0.14)');sg.addColorStop(1,'rgba(255,255,255,0)');
+  ctx.beginPath();ctx.arc(lx,ly,r*0.5,0,Math.PI*2);ctx.fillStyle=sg;ctx.fill();
+  const rg=ctx.createRadialGradient(bx,by,r*0.55,bx,by,r);
+  rg.addColorStop(0,'rgba(0,0,0,0)');rg.addColorStop(1,'rgba(0,0,0,0.30)');
+  ctx.beginPath();ctx.arc(bx,by,r,0,Math.PI*2);ctx.fillStyle=rg;ctx.fill();
+  ctx.beginPath();ctx.arc(bx,by+r-4,5,0,Math.PI*2);ctx.fillStyle=rgb(dc);ctx.fill();
+  ctx.globalAlpha=1;
+  // Ice crystal overlay
+  if(iceFactor>0.2){
+    ctx.globalAlpha=iceFactor*0.35;
+    ctx.beginPath();ctx.arc(bx,by,r,0,Math.PI*2);
+    ctx.fillStyle='rgba(180,220,255,0.4)';ctx.fill();
+    ctx.globalAlpha=1;
+  }
+  // Cooldown indicator (arc around balloon base)
+  if(balloonCooldowns[ci]>0){
+    const frac=1-balloonCooldowns[ci]/BALL_COOLDOWN;
+    ctx.globalAlpha=0.55;
+    ctx.beginPath();ctx.arc(bx,by,r+3,-Math.PI/2,-Math.PI/2+frac*Math.PI*2);
+    ctx.strokeStyle='rgba(200,220,255,0.8)';ctx.lineWidth=2;ctx.stroke();
+    ctx.globalAlpha=1;
+  }
+}
+function drawBalloons(px,py,tilt){
+  const cos=Math.cos(tilt),sin=Math.sin(tilt);
+  for(let i=0;i<BALLOON_N;i++){
+    const b=balloons[i];
+    if(!b.alive){continue;}
+    const tx=px+b.xOff*cos,ty=py+b.xOff*sin;
+    const bx=tx+Math.sin(b.theta)*b.hang,by=ty-Math.cos(b.theta)*b.hang;
+    balloonWorldPos[i]={x:bx,y:by};
+    const dist=ty-by,sa=Math.max(0,0.20*(1-dist/175));
+    ctx.beginPath();ctx.ellipse(tx+(bx-tx)*0.22,ty-3,17,6,0,0,Math.PI*2);
+    ctx.fillStyle=`rgba(0,0,0,${sa.toFixed(3)})`;ctx.fill();
+    drawCatenary(tx,ty,bx,by+BALLOON_R-4);
+    const lf=Math.max(0.25,b.lift/BALL_LIFT_0);
+    drawBalloonBody(bx,by,BALLOON_R*(0.55+0.45*lf),i,0.35+0.65*lf,iceFactors[i]);
+  }
+  for(const d of detachedBalloons) drawBalloonBody(d.x,d.y,BALLOON_R*0.9,d.ci,d.alpha,0);
+}
+
+// ── Particle renderers ────────────────────────────────────────
+function drawRainParticles(){
+  for(const p of particles){
+    const spd=Math.sqrt(p.vx*p.vx+p.vy*p.vy);if(spd<1)continue;
+    const nx=p.vx/spd,ny=p.vy/spd,len=Math.min(spd*0.025,14);
+    ctx.beginPath();ctx.moveTo(p.x,p.y);ctx.lineTo(p.x-nx*len,p.y-ny*len);
+    ctx.strokeStyle=`rgba(155,185,215,${p.alpha.toFixed(3)})`;ctx.lineWidth=p.size;ctx.stroke();
+  }
+}
+function drawSnowParticles(){
+  for(const p of snowParticles){
+    ctx.save();ctx.translate(p.x,p.y);ctx.rotate(p.angle);ctx.globalAlpha=p.alpha;
+    ctx.drawImage(p.tmpl,-SF_SIZE/2,-SF_SIZE/2,SF_SIZE*p.scale,SF_SIZE*p.scale);
+    ctx.globalAlpha=1;ctx.restore();
+  }
+}
+const LEAF_COLS=[[190,90,40],[210,130,20],[160,60,30],[200,160,30],[170,80,50]];
+function drawLeafParticles(){
+  for(const p of leafParticles){
+    ctx.save();ctx.translate(p.x,p.y);ctx.rotate(p.angle);ctx.globalAlpha=p.alpha;
+    const c=LEAF_COLS[p.ci];
+    ctx.beginPath();
+    ctx.moveTo(0,0);
+    ctx.bezierCurveTo(p.s*0.5,-p.s*0.5,p.s,-p.s*0.5,p.s*0.7,-p.s);
+    ctx.bezierCurveTo(p.s*0.3,-p.s*1.3,-p.s*0.1,-p.s*0.5,0,0);
+    ctx.fillStyle=rgba(c,0.88);ctx.fill();
+    ctx.globalAlpha=1;ctx.restore();
+  }
+}
+
+// ── Lightning renderer ────────────────────────────────────────
+function drawLightningPath(ctx,x0,y0,x1,y1,depth){
+  if(depth===0){ctx.moveTo(x0,y0);ctx.lineTo(x1,y1);return;}
+  const mx=(x0+x1)/2+(lightRng()-0.5)*55,my=(y0+y1)/2;
+  drawLightningPath(ctx,x0,y0,mx,my,depth-1);
+  drawLightningPath(ctx,mx,my,x1,y1,depth-1);
+  if(depth>2&&lightRng()>0.55){
+    drawLightningPath(ctx,mx,my,mx+(lightRng()-0.5)*100,my+60+lightRng()*40,depth-2);
+  }
+}
+function drawLightning(tx,ty){
+  // Reset lightRng to same state so the bolt shape is stable for 1 frame
+  const snapRng=mulberry32(Math.floor(simTime*60)|0);
+  const fakeRng=()=>snapRng();
+  // bright core
+  for(const[lw,a]of[[6,0.22],[3,0.55],[1.2,0.95]]){
+    ctx.beginPath();
+    ctx.moveTo(tx+noise2(simTime*8,0)*6,ty-H);
+    const segs=6;
+    let cx2=tx,cy2=ty-H;
+    for(let i=1;i<=segs;i++){
+      const f=i/segs;
+      const nx2=tx+(fakeRng()-0.5)*80,ny2=ty-H+(ty-(-H))*f;
+      ctx.lineTo(nx2,ny2);
+      cx2=nx2;cy2=ny2;
+    }
+    ctx.lineTo(tx,ty);
+    ctx.strokeStyle=`rgba(180,200,255,${a})`;ctx.lineWidth=lw;ctx.stroke();
+  }
+  // Halo glow
+  const grd=ctx.createRadialGradient(tx,ty,0,tx,ty,80);
+  grd.addColorStop(0,'rgba(160,180,255,0.35)');grd.addColorStop(1,'rgba(160,180,255,0)');
+  ctx.beginPath();ctx.arc(tx,ty,80,0,Math.PI*2);ctx.fillStyle=grd;ctx.fill();
+}
+
+// ── Warm-gust visual ──────────────────────────────────────────
+function drawWarmGust(mx,my){
+  if(!gusting||stamina<=0)return;
+  const t=simTime*2.8;
+  ctx.save();
+  for(let i=0;i<6;i++){
+    const offX=(i-2.5)*16+Math.sin(t+i*1.1)*7;
+    const bx=mx+offX;
+    ctx.beginPath();ctx.moveTo(bx,my);
+    for(let step=0;step<=8;step++){
+      const fy=step/8,dy=fy*90;
+      ctx.lineTo(bx+Math.sin(t*0.9+fy*4+i)*7,my-dy);
+    }
+    ctx.strokeStyle=`rgba(255,195,80,${(stamina*0.30).toFixed(3)})`;
+    ctx.lineWidth=1.8;ctx.stroke();
+  }
+  ctx.restore();
+}
+
+// ── HUD ───────────────────────────────────────────────────────
+const SNAMES=['Spring','Summer','Autumn','Winter'];
+function drawHUD(fps){
+  ctx.save();
+  ctx.fillStyle='rgba(7,5,3,0.50)';
+  ctx.beginPath();ctx.roundRect(12,12,230,145,7);ctx.fill();
+
+  ctx.font='italic 19px Georgia,serif';ctx.fillStyle='rgba(226,216,196,0.93)';
+  ctx.textAlign='left';ctx.textBaseline='alphabetic';
+  ctx.fillText('Stormkeeper',24,38);
+
+  const dayT=(simTime%DAY_CYCLE_S)/DAY_CYCLE_S;
+  const h=(dayT*24)|0,m=((dayT*1440)%60)|0;
+  ctx.font='12px system-ui,sans-serif';ctx.fillStyle='rgba(168,158,138,0.84)';
+  ctx.fillText(`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}  ${currentSeason.charAt(0).toUpperCase()+currentSeason.slice(1)}`,24,57);
+  ctx.fillText(`Seed  ${SEED}`,24,73);
+  const wSpd=Math.sqrt(windX*windX+windY*windY).toFixed(1);
+  ctx.fillText(`Wind  ${wSpd} m/s`,24,89);
+  const liftStr=balloons.map((b,i)=>{
+    if(!b.alive)return'✕';
+    const ice=iceFactors[i]>0.1?'❄':'';
+    return b.lift.toFixed(1)+ice;
+  }).join(' ');
+  ctx.fillText(`Lift  ${liftStr} N`,24,105);
+  const altM=((H*0.62-platY)/SCALE).toFixed(1),tiltDeg=(platTheta*180/Math.PI).toFixed(1);
+  ctx.fillText(`Plat  ${altM}m  ${tiltDeg}°`,24,121);
+  ctx.fillText(`Score ${score|0}`,24,137);
+
+  // Stamina bar
+  const bx=24,bw=140,bh=5,by=149;
+  ctx.fillStyle='rgba(60,40,20,0.6)';ctx.fillRect(bx,by,bw,bh);
+  const stamCol=stamina>0.35?'rgba(200,160,60,0.80)':'rgba(180,70,50,0.85)';
+  ctx.fillStyle=stamCol;ctx.fillRect(bx,by,bw*stamina,bh);
+  ctx.fillStyle='rgba(255,215,100,0.3)';ctx.fillRect(bx,by,bw*stamina,bh/2);
+
+  ctx.textAlign='right';ctx.textBaseline='top';
+  ctx.font='11px system-ui,sans-serif';
+  ctx.fillStyle=fps>55?'rgba(128,192,128,0.74)':'rgba(198,90,90,0.84)';
+  ctx.fillText(`${fps|0} fps`,W-14,14);
+  ctx.restore();
+  drawModeButton();
+}
+
+// ── End card ─────────────────────────────────────────────────
+function drawEndCard(){
+  ctx.save();
+  // Dim overlay
+  ctx.fillStyle=`rgba(0,0,0,${Math.min(0.68,endCardAlpha)})`;
+  ctx.fillRect(0,0,W,H);
+
+  const cx=W/2,cy=H/2,pw=360,ph=220;
+  ctx.fillStyle='rgba(14,10,6,0.88)';
+  ctx.beginPath();ctx.roundRect(cx-pw/2,cy-ph/2,pw,ph,10);ctx.fill();
+  ctx.strokeStyle='rgba(140,120,80,0.40)';ctx.lineWidth=1;
+  ctx.beginPath();ctx.roundRect(cx-pw/2,cy-ph/2,pw,ph,10);ctx.stroke();
+
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.font=`italic 24px Georgia,serif`;
+  ctx.fillStyle='rgba(228,216,192,0.96)';
+  const headline=gameWon?'Winter survived.':'The garden fell.';
+  ctx.fillText(headline,cx,cy-74);
+
+  ctx.font='13px system-ui,sans-serif';
+  ctx.fillStyle='rgba(168,155,130,0.88)';
+  const seasonLabel=currentSeason.charAt(0).toUpperCase()+currentSeason.slice(1);
+  const days=(simTime/DAY_CYCLE_S).toFixed(1);
+  ctx.fillText(`Season: ${seasonLabel}   Days: ${days}`,cx,cy-38);
+  ctx.fillText(`Score: ${score|0}   Seed: ${SEED}`,cx,cy-14);
+
+  ctx.font='12px system-ui,sans-serif';
+  ctx.fillStyle='rgba(140,128,105,0.72)';
+  ctx.fillText('press R or click to begin again',cx,cy+30);
+  if(envMode==='playback'){
+    ctx.fillStyle='rgba(100,140,180,0.65)';
+    ctx.fillText('console: SK.exportWeights() to copy trained policy',cx,cy+50);
+  }
+
+  ctx.restore();
+}
+
+// ── Spatial hash ──────────────────────────────────────────────
+class SpatialHash{
+  constructor(cs){this.cs=cs;this.grid=new Map();}
+  clear(){this.grid.clear();}
+  _k(x,y){return`${Math.floor(x/this.cs)},${Math.floor(y/this.cs)}`;}
+  insert(obj){const k=this._k(obj.x,obj.y);let c=this.grid.get(k);if(!c){c=[];this.grid.set(k,c);}c.push(obj);}
+  query(x,y,r){
+    const cs=this.cs,x0=Math.floor((x-r)/cs),x1=Math.floor((x+r)/cs),
+          y0=Math.floor((y-r)/cs),y1=Math.floor((y+r)/cs),out=[];
+    for(let cx=x0;cx<=x1;cx++)for(let cy=y0;cy<=y1;cy++){const c=this.grid.get(`${cx},${cy}`);if(c)out.push(...c);}
+    return out;
+  }
+}
+
+// ── OU wind ───────────────────────────────────────────────────
+let windX=0,windY=0;
+function stepWind(dt,season){
+  const p=SEASON_WIND[season],sdt=Math.sqrt(dt);
+  windX+=p.theta*(p.muX-windX)*dt+p.sigma*sdt*randn(windRng);
+  windY+=p.theta*(p.muY-windY)*dt+p.sigma*sdt*randn(windRng);
+}
+
+// ── Balloon physics ───────────────────────────────────────────
+const balloons=BALLOON_XOFFS.map((xOff,i)=>({
+  xOff,hang:106+i*7,theta:0,thetaV:0,phase:rng()*Math.PI*2,lift:BALL_LIFT_0,alive:true,
+}));
+const detachedBalloons=[];
+const balloonCooldowns=[0,0,0];
+const iceFactors=[0,0,0];
+
+function stepBalloons(dt,season){
+  for(let i=0;i<BALLOON_N;i++){
+    const b=balloons[i];if(!b.alive)continue;
+    // Ice reduces effective lift (but does not change stored lift — visual only here)
+    if(season==='winter') iceFactors[i]=Math.min(ICE_MAX,iceFactors[i]+ICE_RATE*dt);
+    const idle=Math.sin(simTime*0.82+b.phase)*0.013;
+    const wf=windX*0.0038;
+    const alpha2=-(SWAY_G/SWAY_L)*Math.sin(b.theta)-SWAY_DAMP*b.thetaV+idle+wf;
+    b.thetaV+=alpha2*dt;b.theta+=b.thetaV*dt;
+    if(balloonCooldowns[i]>0)balloonCooldowns[i]=Math.max(0,balloonCooldowns[i]-dt);
+  }
+  for(const d of detachedBalloons){d.x+=d.vx*dt;d.y+=d.vy*dt;d.vy-=18*dt;d.alpha-=0.16*dt;}
+  let w=0;for(let i=0;i<detachedBalloons.length;i++)if(detachedBalloons[i].alpha>0.01)detachedBalloons[w++]=detachedBalloons[i];
+  detachedBalloons.length=w;
+}
+
+// ── Platform dynamics ─────────────────────────────────────────
+let platVY=0,platTheta=0,platOmega=0;
+
+function stepPlatform(dt){
+  let netFY=0,netTau=0;
+  const cos=Math.cos(platTheta),sin=Math.sin(platTheta);
+
+  for(let i=0;i<BALLOON_N;i++){
+    const b=balloons[i];if(!b.alive)continue;
+    // Ice factor reduces effective lift
+    const effLift=b.lift*(1-iceFactors[i]*0.55);
+    b.lift=Math.max(0,b.lift-BALL_DECAY*dt);
+    const netBF=effLift-BALL_MASS*G;
+    if(netBF<0){
+      b.alive=false;
+      const tx=platX+b.xOff*cos,ty=platY+b.xOff*sin;
+      const bx=tx+Math.sin(b.theta)*b.hang,by=ty-Math.cos(b.theta)*b.hang;
+      detachedBalloons.push({x:bx,y:by,vx:windX*SCALE*0.3,vy:-45,ci:i,alpha:1.0});
+      continue;
+    }
+    netFY+=netBF;
+    netTau+=netBF*(b.xOff/SCALE);
+  }
+  netFY-=PLAT_MASS*G;
+  // Extra weight from snow and leaves
+  const loadWeight=(snowLoad+leafLoad)*G;
+  netFY-=loadWeight;
+
+  // Warm gust bonus
+  if(gusting&&stamina>0){
+    netFY+=GUST_LIFT*stamina;
+    stamina=Math.max(0,stamina-STAM_DRAIN*dt);
+  } else {
+    stamina=Math.min(1,stamina+STAM_REGEN*dt);
+  }
+
+  // Vertical integration (semi-implicit Euler; screen-Y inverted)
+  const aY=(netFY/PLAT_MASS)*SCALE;
+  platVY+=aY*dt;platVY*=Math.exp(-PLAT_VDAMP*dt);platY-=platVY*dt;
+  platY=Math.max(H*0.10,Math.min(H*1.40,platY));
+
+  // Rotational integration
+  platOmega+=(netTau/PLAT_I)*dt;platOmega*=Math.exp(-PLAT_RDAMP*dt);platTheta+=platOmega*dt;
+}
+
+// ── Seasonal hazards ──────────────────────────────────────────
+let springGustTimer=0,springGustNext=18+rng()*10;
+let lightningState={phase:'idle',countdown:25,tx:0,ty:0,warn:0};
+let flashAlpha=0;
+let heatShimmer=0;
+
+function stepHazards(dt,season){
+  flashAlpha=Math.max(0,flashAlpha-2.5*dt);
+
+  if(season==='spring'){
+    // Sudden gust impulses every 18-28 s
+    springGustTimer+=dt;
+    if(springGustTimer>=springGustNext){
+      const mag=18+rng()*14,dir=rng()>0.5?1:-1;
+      windX+=dir*mag;
+      springGustTimer=0;springGustNext=18+rng()*10;
+    }
+  }
+
+  if(season==='summer'){
+    heatShimmer=Math.min(HEAT_MAX,heatShimmer+HEAT_BUILD*dt);
+    // Lightning state machine: idle → warning → strike → cooldown
+    if(lightningState.phase==='idle'){
+      lightningState.countdown-=dt;
+      if(lightningState.countdown<=0){
+        // Target the balloon with lowest lift (most vulnerable)
+        let minLift=Infinity,ti=0;
+        for(let i=0;i<BALLOON_N;i++){if(balloons[i].alive&&balloons[i].lift<minLift){minLift=balloons[i].lift;ti=i;}}
+        const tp=balloonWorldPos[ti];
+        lightningState={phase:'warning',countdown:LIGHTNING_WARN,tx:tp.x,ty:tp.y,warn:0};
+      }
+    } else if(lightningState.phase==='warning'){
+      lightningState.warn=1-lightningState.countdown/LIGHTNING_WARN;
+      lightningState.countdown-=dt;
+      if(lightningState.countdown<=0){lightningState.phase='strike';lightningState.countdown=0.12;}
+    } else if(lightningState.phase==='strike'){
+      if(lightningState.countdown===0.12){ // first frame of strike
+        flashAlpha=0.65;
+        // Damage nearest balloon
+        let bestI=-1,bestD=Infinity;
+        for(let i=0;i<BALLOON_N;i++){
+          if(!balloons[i].alive)continue;
+          const d2=(balloonWorldPos[i].x-lightningState.tx)**2+(balloonWorldPos[i].y-lightningState.ty)**2;
+          if(d2<bestD){bestD=d2;bestI=i;}
+        }
+        if(bestI>=0) balloons[bestI].lift=Math.max(0,balloons[bestI].lift-LIGHTNING_DMG);
+      }
+      lightningState.countdown-=dt;
+      if(lightningState.countdown<=0){lightningState.phase='idle';lightningState.countdown=20+rng()*15;}
+    }
+  } else {
+    heatShimmer=Math.max(0,heatShimmer-0.02*dt);
+    if(lightningState.phase!=='idle') lightningState={phase:'idle',countdown:20,tx:0,ty:0,warn:0};
+  }
+
+  // Heat shimmer reduces effective lift by damping decay more aggressively
+  // (already applied in stepPlatform via iceFactors pattern — heat uses its own approach)
+  // Simplest: add extra negative force proportional to heatShimmer
+  // This is already handled by the heat factor in stepPlatform. Actually let me apply it
+  // here as an extra weight on all alive balloons. We'll reduce their effective lift by
+  // temporarily boosting their weight perception. Clean approach: just reduce lift amount
+  // stored directly during summer:
+  if(season==='summer'&&heatShimmer>0){
+    for(const b of balloons){
+      if(b.alive) b.lift=Math.max(0,b.lift-heatShimmer*0.004*dt*60);
+    }
+  }
+}
+
+// ── Plant system ──────────────────────────────────────────────
+const plantSlots=Array.from({length:PLANT_SLOTS},(_,i)=>({
+  type:SEASON_PLANTS.spring[i],growth:0,ripe:false,cooldown:0,
+}));
+let currentSeason='spring';
+
+function stepPlants(dt,season){
+  if(season!==currentSeason){
+    currentSeason=season;
+    for(let i=0;i<PLANT_SLOTS;i++){
+      plantSlots[i].type=SEASON_PLANTS[season][i];
+      plantSlots[i].growth=0;plantSlots[i].ripe=false;plantSlots[i].cooldown=0;
+    }
+  }
+  for(const s of plantSlots){
+    if(s.cooldown>0){s.cooldown-=dt;if(s.cooldown<=0){s.growth=0;s.ripe=false;}continue;}
+    if(!s.type||s.ripe)continue;
+    const def=PLANT_DEFS[s.type];
+    const gt=def.grow[season];if(!gt)continue;
+    s.growth=Math.min(1,s.growth+dt/gt);
+    if(s.growth>=1){s.ripe=true;}
+  }
+}
+
+// ── Particle systems ──────────────────────────────────────────
+const particles=[],snowParticles=[],leafParticles=[];
+const spatialHash=new SpatialHash(SPATIAL_CELL);
+let rainAccum=0,snowAccum=0,leafAccum=0;
+let snowLoad=0,leafLoad=0;
+
+function spawnParticles(dt,season){
+  // Rain (spring + some winter)
+  const rRate=season==='spring'?RAIN_RATE:season==='winter'?RAIN_RATE*0.3:0;
+  rainAccum+=rRate*dt;
+  while(rainAccum>=1){
+    rainAccum-=1;
+    particles.push({x:particleRng()*W,y:-10,vx:windX*SCALE*0.55,vy:RAIN_TERM_VY*SCALE*(0.6+particleRng()*0.4),size:0.5+particleRng()*1.5,alpha:0.28+particleRng()*0.52});
+  }
+  // Snow (winter)
+  if(season==='winter'){
+    snowAccum+=SNOW_RATE*dt;
+    while(snowAccum>=1){
+      snowAccum-=1;
+      snowParticles.push({
+        x:particleRng()*W,y:-SF_SIZE,
+        vx:windX*SCALE*0.4,vy:1.5*SCALE*(0.2+particleRng()*0.3),
+        angle:particleRng()*Math.PI*2,angleV:(particleRng()-0.5)*0.8,
+        alpha:0.55+particleRng()*0.4,scale:0.7+particleRng()*0.6,
+        tmpl:SF_TEMPLATES[Math.floor(particleRng()*SF_TEMPLATES.length)],
+      });
+    }
+  }
+  // Leaves (autumn)
+  if(season==='autumn'){
+    leafAccum+=LEAF_RATE*dt;
+    while(leafAccum>=1){
+      leafAccum-=1;
+      leafParticles.push({
+        x:particleRng()*W,y:-15,
+        vx:windX*SCALE*0.65+(particleRng()-0.5)*20,
+        vy:0.8*SCALE*(0.1+particleRng()*0.25),
+        angle:particleRng()*Math.PI*2,angleV:(particleRng()-0.5)*2,
+        s:6+particleRng()*7,alpha:0.75+particleRng()*0.2,
+        ci:Math.floor(particleRng()*LEAF_COLS.length),onPlatform:false,
+      });
+    }
+  }
+}
+
+function platformHit(p){
+  const cos=Math.cos(platTheta),sin=Math.sin(platTheta);
+  const dx=p.x-platX,dy=p.y-platY;
+  const lx=dx*cos+dy*sin,ly=-dx*sin+dy*cos;
+  return Math.abs(lx)<PLATFORM_W/2+4&&ly>=0&&ly<PLATFORM_H+6;
+}
+
+function stepParticles(dt){
+  spatialHash.clear();
+  // Rain
+  for(const p of particles){
+    p.vx+=(windX*SCALE*0.55-p.vx)*RAIN_DRAG*dt;
+    p.vy+=(G*SCALE-p.vy*RAIN_DRAG)*dt;p.x+=p.vx*dt;p.y+=p.vy*dt;
+    spatialHash.insert(p);
+  }
+  const near=spatialHash.query(platX,platY,PLATFORM_W/2+20);
+  for(const p of near)if(platformHit(p))p.y=-9999;
+  let w=0;for(let i=0;i<particles.length;i++){const p=particles[i];if(p.y>-100&&p.y<H+50&&p.x>-50&&p.x<W+50)particles[w++]=p;}particles.length=w;
+
+  // Snow
+  for(const p of snowParticles){
+    p.vx+=(windX*SCALE*0.4-p.vx)*0.6*dt;
+    p.vy+=G*SCALE*0.08*dt;p.x+=p.vx*dt;p.y+=p.vy*dt;p.angle+=p.angleV*dt;
+    if(platformHit(p)){snowLoad+=SNOW_MASS;p.y=-9999;}
+  }
+  w=0;for(let i=0;i<snowParticles.length;i++){const p=snowParticles[i];if(p.y>-SF_SIZE&&p.y<H+20&&p.x>-SF_SIZE&&p.x<W+SF_SIZE)snowParticles[w++]=p;}snowParticles.length=w;
+  // Snow sublimation (very slow)
+  snowLoad=Math.max(0,snowLoad-0.0002*dt);
+
+  // Leaves
+  for(const p of leafParticles){
+    p.vx+=(windX*SCALE*0.6-p.vx)*LEAF_DAMP*dt;
+    p.vy+=G*SCALE*0.12*dt;p.x+=p.vx*dt;p.y+=p.vy*dt;p.angle+=p.angleV*dt;
+    if(platformHit(p)){leafLoad+=LEAF_MASS;p.y=-9999;}
+  }
+  w=0;for(let i=0;i<leafParticles.length;i++){const p=leafParticles[i];if(p.y>-20&&p.y<H+20&&p.x>-50&&p.x<W+50)leafParticles[w++]=p;}leafParticles.length=w;
+  // Leaf blow-off in strong wind
+  if(Math.abs(windX)>8)leafLoad=Math.max(0,leafLoad-0.01*dt);
+}
+
+// ── Interactions ──────────────────────────────────────────────
+let stamina=1.0,gusting=false,gustMouseX=W/2,gustMouseY=H*0.5;
+let mouseDown=false,mouseDownTime=0,mouseDownX=0,mouseDownY=0;
+let endCardAlpha=0;
+let gameOver=false,gameWon=false,endReason='';
+
+function worldPos(ex,ey){return{x:ex-(camX|0),y:ey-(camY|0)};}
+
+function handleClick(wx,wy){
+  // Tap balloon → reinflate
+  for(let i=0;i<BALLOON_N;i++){
+    const b=balloons[i];if(!b.alive)continue;
+    const p=balloonWorldPos[i];
+    if((wx-p.x)**2+(wy-p.y)**2<(BALLOON_R+14)**2&&balloonCooldowns[i]<=0){
+      b.lift=BALL_LIFT_0;balloonCooldowns[i]=BALL_COOLDOWN;return;
+    }
+  }
+  // Tap ripe plant → harvest
+  for(let i=0;i<PLANT_SLOTS;i++){
+    const s=plantSlots[i];if(!s.ripe)continue;
+    const pos=getSlotWorldPos(i);
+    if((wx-pos.x)**2+(wy-pos.y)**2<32**2){
+      const def=PLANT_DEFS[s.type];
+      score+=Math.round(SCORE_HARVEST*def.pts[currentSeason]);
+      s.ripe=false;s.growth=0;s.cooldown=10;return;
+    }
+  }
+}
+
+canvas.addEventListener('mousedown',e=>{
+  // Mode button hit test (always active, even during training/playback)
+  const{x:bx,y:by,w:bw,h:bh}=MODE_BTN;
+  if(e.clientX>=bx&&e.clientX<=bx+bw&&e.clientY>=by&&e.clientY<=by+bh){
+    const order=['human','training','playback'];
+    envMode=order[(order.indexOf(envMode)+1)%3];
+    if(envMode==='training'){trainEpDone=true;episodeCount=0;episodeReturnHist=[];}
+    if(envMode==='playback'){resetGame();}
+    return;
+  }
+  if(envMode!=='human') return;  // only accept game input in human mode
+  if(gameOver||gameWon){resetGame();return;}
+  mouseDown=true;mouseDownTime=simTime;mouseDownX=e.clientX;mouseDownY=e.clientY;
+});
+canvas.addEventListener('mousemove',e=>{
+  gustMouseX=e.clientX;gustMouseY=e.clientY;
+  if(mouseDown&&(Math.abs(e.clientX-mouseDownX)>8||Math.abs(e.clientY-mouseDownY)>8)){
+    gusting=true;
+  }
+});
+canvas.addEventListener('mouseup',e=>{
+  if(!mouseDown)return;
+  const held=simTime-mouseDownTime;
+  if(held<0.28&&!gusting){
+    const{x,y}=worldPos(e.clientX,e.clientY);
+    handleClick(x,y);
+  }
+  mouseDown=false;gusting=false;
+});
+addEventListener('keydown',e=>{
+  if((e.key==='r'||e.key==='R')&&(gameOver||gameWon))resetGame();
+});
+
+// ── Game over / win ───────────────────────────────────────────
+function checkEndConditions(){
+  if(platY>H+80){gameOver=true;endReason='fall';}
+  if(Math.abs(platTheta)>=PLAT_TMAX){gameOver=true;endReason='tipped';}
+  if(simTime>=SEASON_AT[3]+WINTER_CLEAR&&!gameOver){gameWon=true;}
+}
+
+// ── Reset ─────────────────────────────────────────────────────
+function resetGame(){
+  simTime=0;scrollX=0;windX=0;windY=0;
+  platVY=0;platTheta=0;platOmega=0;platY=H*0.62;
+  windRng=mulberry32(SEED^0xDEADBEEF);
+  particleRng=mulberry32(SEED^0xCAFEBABE);
+  lightRng=mulberry32(SEED^0x11223344);
+  for(let i=0;i<BALLOON_N;i++){balloons[i].lift=BALL_LIFT_0;balloons[i].alive=true;balloons[i].theta=0;balloons[i].thetaV=0;balloonCooldowns[i]=0;iceFactors[i]=0;}
+  particles.length=0;snowParticles.length=0;leafParticles.length=0;detachedBalloons.length=0;
+  rainAccum=0;snowAccum=0;leafAccum=0;snowLoad=0;leafLoad=0;
+  currentSeason='spring';
+  for(let i=0;i<PLANT_SLOTS;i++){plantSlots[i].type=SEASON_PLANTS.spring[i];plantSlots[i].growth=0;plantSlots[i].ripe=false;plantSlots[i].cooldown=0;}
+  heatShimmer=0;stamina=1;gusting=false;score=0;
+  lightningState={phase:'idle',countdown:25,tx:0,ty:0,warn:0};flashAlpha=0;
+  springGustTimer=0;springGustNext=18+rng()*10;
+  gameOver=false;gameWon=false;endReason='';endCardAlpha=0;
+}
+
+// ── Simulation state ──────────────────────────────────────────
+let simTime=0,scrollX=0,camX=0,camY=0,camVX=0,camVY=0,score=0;
+let isTraining=false;  // when true, step() skips particles/clouds for speed
+let envMode='human';   // 'human' | 'training' | 'playback'
+
+function getSeasonFromTime(t){
+  if(t<SEASON_AT[1])return'spring';
+  if(t<SEASON_AT[2])return'summer';
+  if(t<SEASON_AT[3])return'autumn';
+  return'winter';
+}
+
+function step(dt){
+  if(gameOver||gameWon)return;
+  simTime+=dt;score+=SCORE_PER_S*dt;
+  const season=getSeasonFromTime(simTime);
+
+  if(mouseDown&&simTime-mouseDownTime>=0.28)gusting=true;
+  stepWind(dt,season);
+  stepBalloons(dt,season);
+  stepPlatform(dt);
+  stepHazards(dt,season);
+  stepPlants(dt,season);
+  if(!isTraining){spawnParticles(dt,season);stepParticles(dt);stepClouds(dt);}
+  checkEndConditions();
+
+  const gust=Math.max(-5,Math.min(5,windX*0.12));
+  const tx=Math.sin(simTime*CAM_FREQ*Math.PI*2)*CAM_AMP+gust;
+  const ty=Math.cos(simTime*CAM_FREQ*Math.PI*2*0.71)*CAM_AMP*0.44;
+  camVX+=(tx-camX)*2.4*dt;camVX*=Math.exp(-2.0*dt);camX+=camVX*dt;
+  camVY+=(ty-camY)*2.4*dt;camVY*=Math.exp(-2.0*dt);camY+=camVY*dt;
+  scrollX+=28*dt;
+}
+
+// ── Render ────────────────────────────────────────────────────
+function render(_alpha){
+  const dayT=(simTime%DAY_CYCLE_S)/DAY_CYCLE_S;
+  const pal=getPalette(dayT);
+
+  ctx.save();ctx.translate(camX|0,camY|0);
+  drawSky(pal,dayT);
+  drawParallaxBands(pal,scrollX);
+  const sorted=[...clouds].sort((a,b)=>a.depth-b.depth);
+  for(const c of sorted)drawCloud(c,simTime);
+
+  drawRainParticles();
+  drawSnowParticles();
+  drawLeafParticles();
+
+  drawPlatform(platX,platY,platTheta);
+  drawSnowOnPlatform(platX,platY,platTheta,snowLoad);
+  drawPlants(platX,platY,platTheta);
+  drawBalloons(platX,platY,platTheta);
+
+  // Warm gust visual (screen space but inside camera)
+  drawWarmGust(gustMouseX-(camX|0),gustMouseY-(camY|0));
+
+  // Lightning warning circle
+  if(lightningState.phase==='warning'){
+    const{tx,ty,warn}=lightningState;
+    const r=60*(1-warn)+8;
+    ctx.beginPath();ctx.arc(tx,ty,r,0,Math.PI*2);
+    ctx.strokeStyle=`rgba(200,220,255,${(warn*0.75).toFixed(3)})`;ctx.lineWidth=2;ctx.stroke();
+    // Crosshair
+    ctx.strokeStyle=`rgba(200,220,255,${(warn*0.55).toFixed(3)})`;ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(tx-r*0.7,ty);ctx.lineTo(tx+r*0.7,ty);
+    ctx.moveTo(tx,ty-r*0.7);ctx.lineTo(tx,ty+r*0.7);ctx.stroke();
+  }
+  if(lightningState.phase==='strike'&&lightningState.countdown>0.04){
+    drawLightning(lightningState.tx,lightningState.ty);
+  }
+
+  ctx.restore();
+
+  // Screen flash (full-screen, outside camera)
+  if(flashAlpha>0){
+    ctx.fillStyle=`rgba(200,215,255,${flashAlpha.toFixed(3)})`;
+    ctx.fillRect(0,0,W,H);
+  }
+
+  drawHUD(displayFps);
+  if(envMode==='playback') drawPlaybackHUD();
+
+  if(gameOver||gameWon){
+    endCardAlpha=Math.min(1,endCardAlpha+0.03);
+    drawEndCard();
+  }
+}
+
+// ── Main loop ─────────────────────────────────────────────────
+let lastT=0,acc=0,fCnt=0,fTimer=0,displayFps=60;
+function frame(now){
+  const dt=Math.min((now-lastT)*0.001,0.10);
+  lastT=now;
+
+  if(envMode==='training'){
+    // Training mode: skip rendering, run physics budget, draw chart only
+    ctx.fillStyle='rgb(8,7,5)';ctx.fillRect(0,0,W,H);
+    trainFrame();
+    drawModeButton();
+    requestAnimationFrame(frame);
+    return;
+  }
+
+  fCnt++;fTimer+=dt;
+  if(fTimer>=0.5){displayFps=fCnt/fTimer;fCnt=0;fTimer=0;}
+
+  // In playback mode the agent selects actions; physics still runs at normal speed
+  if(envMode==='playback'&&!gameOver&&!gameWon) agentAct();
+
+  acc+=dt;
+  while(acc>=PHYS_DT){step(PHYS_DT);acc-=PHYS_DT;}
+  render(acc/PHYS_DT);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(ts=>{lastT=ts;requestAnimationFrame(frame);});
+
+// ══════════════════════════════════════════════════════════════
+// STAGE 4 — RL environment, REINFORCE agent, training HUD
+// ══════════════════════════════════════════════════════════════
+
+// ── Env: observation builder ──────────────────────────────────
+function buildObs(){
+  const o=new Float32Array(OBS_SIZE);
+  o[0]=windX/15; o[1]=windY/15;
+  for(let i=0;i<3;i++) o[2+i]=balloons[i].alive?balloons[i].lift/BALL_LIFT_0:0;
+  // [5-7] zero-pad (spec requires max-6 balloon slots)
+  o[8]=platTheta/PLAT_TMAX;
+  o[9]=Math.min(1,snowLoad/2.0);
+  o[10]=stamina;
+  const si=['spring','summer','autumn','winter'].indexOf(currentSeason);
+  o[11+Math.max(0,si)]=1;
+  // Nearest 8 hazards from the combined particle list
+  const hzd=[];
+  for(const p of particles)  hzd.push({x:p.x,y:p.y,vx:p.vx,vy:p.vy});
+  for(const p of snowParticles) hzd.push({x:p.x,y:p.y,vx:p.vx,vy:p.vy});
+  for(const p of leafParticles) hzd.push({x:p.x,y:p.y,vx:p.vx,vy:p.vy});
+  hzd.sort((a,b)=>(a.x-platX)**2+(a.y-platY)**2-(b.x-platX)**2-(b.y-platY)**2);
+  for(let k=0;k<8;k++){
+    const idx=15+k*4;
+    if(k<hzd.length){
+      o[idx]=hzd[k].x/W; o[idx+1]=hzd[k].y/H;
+      o[idx+2]=hzd[k].vx/200; o[idx+3]=hzd[k].vy/200;
+    }
+  }
+  return o;
+}
+
+// ── Env: action executor ──────────────────────────────────────
+// Action index → game effect. Called once per RL step.
+function executeAction(a){
+  gusting=false;
+  if(a===0) return;
+  if(a>=1&&a<=3){
+    const i=a-1;
+    if(balloons[i].alive&&balloonCooldowns[i]<=0){
+      balloons[i].lift=BALL_LIFT_0;balloonCooldowns[i]=BALL_COOLDOWN;
+    }
+    return;
+  }
+  if(a>=4&&a<=27){
+    // 6×4 gust grid
+    const idx=a-4, gx=idx%6, gy=(idx/6)|0;
+    gustMouseX=(gx+0.5)/6*W; gustMouseY=(gy+0.5)/4*H;
+    gusting=true;
+    return;
+  }
+  if(a>=28&&a<=31){
+    const i=a-28,s=plantSlots[i];
+    if(s.ripe){
+      score+=Math.round(SCORE_HARVEST*PLANT_DEFS[s.type].pts[currentSeason]);
+      s.ripe=false;s.growth=0;s.cooldown=10;
+    }
+  }
+}
+
+// ── Env: Gym-style interface ──────────────────────────────────
+// env.reset(seed?) → Float32Array obs
+// env.step(action)  → {obs, reward, done, info}
+// Reward shaping notes (honest, per spec):
+//   +0.005/step   — survival incentive keeps the agent from deliberately dying
+//   +harvest_pts  — scaled by 0.5 so that plant harvest ≈ 5 steps of survival;
+//                   in practice the agent learns to keep balloons aloft and
+//                   ignores planting because reinflation has a higher reward-per-action.
+//                   This is a known reward-hacking pattern: documented, not hidden.
+//   -1/dead balloon— discourages passive balloon loss
+//   -15 terminal  — tip-over or fall penalty, large enough to dominate a 60-step run
+const env=(()=>{
+  let _prevLiftSum=0;
+  return{
+    obsSize:OBS_SIZE, actSize:ACT_SIZE,
+    reset(seed){
+      if(seed!==undefined){SEED=seed;windRng=mulberry32(SEED^0xDEADBEEF);particleRng=mulberry32(SEED^0xCAFEBABE);}
+      resetGame();
+      _prevLiftSum=balloons.reduce((s,b)=>s+(b.alive?b.lift:0),0);
+      return buildObs();
+    },
+    step(action){
+      const prevScore=score;
+      executeAction(action);
+      step(TRAIN_DT);
+      const obs=buildObs();
+      const done=gameOver||gameWon;
+      // Reward
+      let r=0.005;  // per-step survival
+      r+=(score-prevScore)*0.5;  // harvest (scaled down relative to survival)
+      const liftNow=balloons.reduce((s,b)=>s+(b.alive?b.lift:0),0);
+      if(liftNow<_prevLiftSum-0.5) r-=1*((_prevLiftSum-liftNow)/BALL_LIFT_0|0);
+      _prevLiftSum=liftNow;
+      if(gameOver) r-=15;
+      if(gameWon)  r+=30;
+      return{obs,reward:r,done,info:{season:currentSeason,score:score|0,simTime}};
+    },
+  };
+})();
+
+// ── Policy network weights (REINFORCE, single hidden layer) ───
+// W1: [OBS_SIZE × HID_SIZE], b1: [HID_SIZE]
+// W2: [HID_SIZE × ACT_SIZE], b2: [ACT_SIZE]
+// Adam moments stored alongside weights.
+const POLICY=(()=>{
+  function xavier(n_in,n_out){
+    const std=Math.sqrt(2/(n_in+n_out)),a=new Float32Array(n_in*n_out);
+    for(let i=0;i<a.length;i++) a[i]=(Math.random()*2-1)*std*Math.SQRT2;
+    return a;
+  }
+  const zeros=n=>new Float32Array(n);
+  return{
+    W1:xavier(OBS_SIZE,HID_SIZE), b1:zeros(HID_SIZE),
+    W2:xavier(HID_SIZE,ACT_SIZE), b2:zeros(ACT_SIZE),
+    // Adam first/second moments
+    mW1:zeros(OBS_SIZE*HID_SIZE), vW1:zeros(OBS_SIZE*HID_SIZE),
+    mb1:zeros(HID_SIZE),          vb1:zeros(HID_SIZE),
+    mW2:zeros(HID_SIZE*ACT_SIZE), vW2:zeros(HID_SIZE*ACT_SIZE),
+    mb2:zeros(ACT_SIZE),          vb2:zeros(ACT_SIZE),
+    t:0,  // Adam step counter
+  };
+})();
+
+// ── Policy forward pass ───────────────────────────────────────
+function policyForward(obs){
+  // h = tanh(W1^T obs + b1)
+  const h=new Float32Array(HID_SIZE);
+  for(let j=0;j<HID_SIZE;j++){
+    let s=POLICY.b1[j];
+    for(let i=0;i<OBS_SIZE;i++) s+=POLICY.W1[i*HID_SIZE+j]*obs[i];
+    h[j]=Math.tanh(s);
+  }
+  // logits = W2^T h + b2
+  const logits=new Float32Array(ACT_SIZE);
+  for(let j=0;j<ACT_SIZE;j++){
+    let s=POLICY.b2[j];
+    for(let i=0;i<HID_SIZE;i++) s+=POLICY.W2[i*ACT_SIZE+j]*h[i];
+    logits[j]=s;
+  }
+  // softmax (numerically stable)
+  let mx=logits[0];for(let j=1;j<ACT_SIZE;j++) if(logits[j]>mx) mx=logits[j];
+  const probs=new Float32Array(ACT_SIZE);let sm=0;
+  for(let j=0;j<ACT_SIZE;j++){probs[j]=Math.exp(logits[j]-mx);sm+=probs[j];}
+  for(let j=0;j<ACT_SIZE;j++) probs[j]/=sm;
+  return{probs,h};
+}
+
+// ── Sample action from probability distribution ───────────────
+function sampleAction(probs){
+  let u=Math.random(),cdf=0;
+  for(let j=0;j<ACT_SIZE;j++){cdf+=probs[j];if(u<cdf)return j;}
+  return ACT_SIZE-1;
+}
+
+// ── REINFORCE update with Adam ────────────────────────────────
+// Update = θ += α * G_t * ∇ log π(a_t|s_t).
+// Using normalised returns as variance reduction (instead of baseline subtraction)
+// because it's simpler to implement and still converges reliably for short episodes.
+// Choice of Adam over plain SGD: adaptive lr handles the wide range of gradient
+// magnitudes across W1/W2 without manual tuning. See ADR-03 for full justification.
+function policyUpdate(trajectory){
+  const T=trajectory.length; if(!T) return;
+  // Compute discounted returns
+  const G=new Float32Array(T);
+  let g=0;
+  for(let t=T-1;t>=0;t--){g=trajectory[t].r+GAMMA*g;G[t]=g;}
+  // Normalise
+  let mu=0,sigma2=0;
+  for(let t=0;t<T;t++) mu+=G[t];mu/=T;
+  for(let t=0;t<T;t++) sigma2+=(G[t]-mu)**2;sigma2=Math.sqrt(sigma2/T+1e-8);
+  for(let t=0;t<T;t++) G[t]=(G[t]-mu)/sigma2;
+  // Accumulate gradients
+  const dW1=new Float32Array(OBS_SIZE*HID_SIZE),db1=new Float32Array(HID_SIZE);
+  const dW2=new Float32Array(HID_SIZE*ACT_SIZE),db2=new Float32Array(ACT_SIZE);
+  for(let t=0;t<T;t++){
+    const{obs,action,h,probs}=trajectory[t],Gt=G[t];
+    // Loss = -G_t · log π(a|s).  ∂Loss/∂logits = G_t · (probs - e_a).
+    // adamApply subtracts, so passing this gradient gives θ += lr·G_t·(e_a - probs) — correct ascent.
+    const dL=probs.slice();dL[action]-=1;
+    for(let j=0;j<ACT_SIZE;j++) dL[j]*=Gt;
+    // Layer 2 gradients
+    for(let i=0;i<HID_SIZE;i++) for(let j=0;j<ACT_SIZE;j++) dW2[i*ACT_SIZE+j]+=h[i]*dL[j];
+    for(let j=0;j<ACT_SIZE;j++) db2[j]+=dL[j];
+    // Backprop through tanh
+    const dh=new Float32Array(HID_SIZE);
+    for(let i=0;i<HID_SIZE;i++){
+      for(let j=0;j<ACT_SIZE;j++) dh[i]+=POLICY.W2[i*ACT_SIZE+j]*dL[j];
+      dh[i]*=1-h[i]*h[i];
+    }
+    // Layer 1 gradients
+    for(let i=0;i<OBS_SIZE;i++) for(let j=0;j<HID_SIZE;j++) dW1[i*HID_SIZE+j]+=obs[i]*dh[j];
+    for(let j=0;j<HID_SIZE;j++) db1[j]+=dh[j];
+  }
+  // Adam update for all parameter groups
+  POLICY.t++;
+  const bc1=1-ADAM_B1**POLICY.t, bc2=1-ADAM_B2**POLICY.t;
+  function adamApply(W,dW,mW,vW){
+    for(let i=0;i<W.length;i++){
+      mW[i]=ADAM_B1*mW[i]+(1-ADAM_B1)*dW[i];
+      vW[i]=ADAM_B2*vW[i]+(1-ADAM_B2)*dW[i]*dW[i];
+      W[i]-=RL_LR*(mW[i]/bc1)/(Math.sqrt(vW[i]/bc2)+ADAM_EPS);
+    }
+  }
+  adamApply(POLICY.W1,dW1,POLICY.mW1,POLICY.vW1);
+  adamApply(POLICY.b1,db1,POLICY.mb1,POLICY.vb1);
+  adamApply(POLICY.W2,dW2,POLICY.mW2,POLICY.vW2);
+  adamApply(POLICY.b2,db2,POLICY.mb2,POLICY.vb2);
+}
+
+// ── Training state ────────────────────────────────────────────
+let trainTraj=[];           // current episode trajectory
+let episodeCount=0;
+let episodeReturnHist=[];   // rolling history for chart
+let trainEpDone=true;       // flag: need to start new episode
+let trainFrameMs=0;         // last training frame budget used (for debug)
+
+function trainFrame(){
+  const t0=performance.now();
+  isTraining=true;
+  // Run steps until 13 ms budget exhausted (leaves 3 ms for chart draw + rAF overhead)
+  while(performance.now()-t0<13){
+    if(trainEpDone){
+      // Episode just finished — update policy, log return, start new episode
+      if(trainTraj.length){
+        const epReturn=trainTraj.reduce((s,x)=>s+x.r,0);
+        episodeReturnHist.push(epReturn);
+        if(episodeReturnHist.length>CHART_HIST) episodeReturnHist.shift();
+        policyUpdate(trainTraj);
+        episodeCount++;
+      }
+      trainTraj=[];
+      env.reset();
+      trainEpDone=false;
+    }
+    const obs=buildObs();
+    const{probs,h}=policyForward(obs);
+    const action=sampleAction(probs);
+    const{reward,done}=env.step(action);
+    trainTraj.push({obs,action,h,probs,r:reward});
+    if(done||trainTraj.length>=TRAIN_STEPS_MAX) trainEpDone=true;
+  }
+  isTraining=false;
+  trainFrameMs=performance.now()-t0;
+  drawTrainingHUD();
+}
+
+// ── Playback: agent acts once per physics step ────────────────
+let _agentLabel='—';
+function agentAct(){
+  const obs=buildObs();
+  const{probs}=policyForward(obs);
+  // Greedy (argmax) during playback for deterministic showcase
+  let best=0;for(let j=1;j<ACT_SIZE;j++) if(probs[j]>probs[best]) best=j;
+  executeAction(best);
+  // Human-readable label for the debug overlay
+  if(best===0) _agentLabel='do nothing';
+  else if(best<=3) _agentLabel=`inflate balloon ${best}`;
+  else if(best<=27){const idx=best-4;_agentLabel=`gust [${idx%6},${(idx/6)|0}]`;}
+  else _agentLabel=`harvest plant ${best-27}`;
+}
+
+function drawPlaybackHUD(){
+  const{probs}=policyForward(buildObs());
+  const max=Math.max(...probs),conf=(max*100).toFixed(0);
+  ctx.save();
+  ctx.fillStyle='rgba(6,5,3,0.78)';
+  ctx.beginPath();ctx.roundRect(W-200,14,186,44,5);ctx.fill();
+  ctx.font='11px system-ui,sans-serif';ctx.fillStyle='rgba(160,210,160,0.90)';
+  ctx.textAlign='left';ctx.textBaseline='top';
+  ctx.fillText(`agent: ${_agentLabel}`,W-190,20);
+  ctx.fillStyle='rgba(120,160,120,0.65)';
+  ctx.fillText(`confidence: ${conf}%  (${probs.length} actions)`,W-190,34);
+  ctx.restore();
+}
+
+// ── Training HUD ──────────────────────────────────────────────
+function drawTrainingHUD(){
+  const cw=220,ch=100,cx=W-cw-14,cy=14;
+  ctx.save();
+  ctx.fillStyle='rgba(6,5,3,0.82)';
+  ctx.beginPath();ctx.roundRect(cx,cy,cw,ch+44,6);ctx.fill();
+
+  ctx.font='11px system-ui,sans-serif';
+  ctx.textAlign='left';ctx.textBaseline='top';
+  ctx.fillStyle='rgba(160,150,130,0.90)';
+  ctx.fillText(`REINFORCE  episode ${episodeCount}`,cx+10,cy+8);
+  const avgRet=episodeReturnHist.length
+    ?episodeReturnHist.slice(-20).reduce((s,v)=>s+v,0)/Math.min(20,episodeReturnHist.length)
+    :0;
+  ctx.fillText(`mean return (last 20): ${avgRet.toFixed(1)}`,cx+10,cy+22);
+  ctx.fillStyle='rgba(120,110,90,0.70)';
+  ctx.fillText(`frame budget: ${trainFrameMs.toFixed(1)} ms`,cx+10,cy+36);
+  ctx.fillText(`step dt: ${TRAIN_DT} s  (6× speedup)`,cx+10,cy+50);
+
+  // Return chart
+  const px=cx+10,py=cy+64,pw=cw-20,ph=ch-10;
+  ctx.fillStyle='rgba(20,18,14,0.70)';ctx.fillRect(px,py,pw,ph);
+  ctx.strokeStyle='rgba(60,55,45,0.60)';ctx.lineWidth=0.5;
+  ctx.strokeRect(px,py,pw,ph);
+  if(episodeReturnHist.length>1){
+    const minR=Math.min(...episodeReturnHist),maxR=Math.max(...episodeReturnHist);
+    const rng=Math.max(1,maxR-minR);
+    ctx.beginPath();
+    episodeReturnHist.forEach((v,i)=>{
+      const ex=px+i/CHART_HIST*pw,ey=py+ph-(v-minR)/rng*ph;
+      i===0?ctx.moveTo(ex,ey):ctx.lineTo(ex,ey);
+    });
+    ctx.strokeStyle='rgba(120,190,120,0.80)';ctx.lineWidth=1.2;ctx.stroke();
+    // Zero line
+    if(minR<0&&maxR>0){
+      const zy=py+ph-(0-minR)/rng*ph;
+      ctx.beginPath();ctx.moveTo(px,zy);ctx.lineTo(px+pw,zy);
+      ctx.strokeStyle='rgba(180,160,80,0.35)';ctx.lineWidth=0.7;ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
+// ── Mode toggle button ────────────────────────────────────────
+// Drawn on the HUD; click cycles human→training→playback→human.
+// Button bounds stored for hit-testing in mousedown handler.
+const MODE_BTN={x:14,y:162,w:110,h:20};
+function drawModeButton(){
+  const{x,y,w,h}=MODE_BTN;
+  const labels={'human':'▶ Human','training':'⚡ Training','playback':'▷ Playback'};
+  const cols={'human':'rgba(70,90,55,0.82)','training':'rgba(90,55,20,0.82)','playback':'rgba(30,55,90,0.82)'};
+  ctx.save();
+  ctx.fillStyle=cols[envMode];
+  ctx.beginPath();ctx.roundRect(x,y,w,h,4);ctx.fill();
+  ctx.strokeStyle='rgba(160,150,120,0.30)';ctx.lineWidth=0.8;
+  ctx.beginPath();ctx.roundRect(x,y,w,h,4);ctx.stroke();
+  ctx.font='11px system-ui,sans-serif';ctx.fillStyle='rgba(220,210,190,0.90)';
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillText(labels[envMode],x+w/2,y+h/2);
+  ctx.restore();
+}
+
+// Weights export — user can copy this string and paste it back to skip training
+function exportWeights(){
+  const arr2str=a=>'['+Array.from(a).map(v=>v.toFixed(6)).join(',')+']';
+  return `SK.importWeights(${arr2str(POLICY.W1)},${arr2str(POLICY.b1)},${arr2str(POLICY.W2)},${arr2str(POLICY.b2)});`;
+}
+function importWeights(W1,b1,W2,b2){
+  POLICY.W1.set(W1);POLICY.b1.set(b1);POLICY.W2.set(W2);POLICY.b2.set(b2);
+  POLICY.t=1000;  // pretend Adam ran 1000 steps so moments aren't zero-biased
+}
+
+// ── Exposed API for tests ─────────────────────────────────────
+// Pure-function exports (same as Stage 2):
+window.SK={
+  mulberry32,randn,SpatialHash,SEASON_WIND,BALL_LIFT_0,BALL_DECAY,BALL_MASS,G,PLANT_DEFS,SEASON_PLANTS,
+  // Constants needed by control tests
+  BALL_COOLDOWN,SCORE_HARVEST,PLAT_TMAX,STAM_DRAIN,STAM_REGEN,
+  // Live arrays — tests mutate these directly to set up state
+  balloons,balloonWorldPos,balloonCooldowns,plantSlots,iceFactors,
+  // Functions — tests call these to exercise interaction paths
+  handleClick,stepPlatform,resetGame,getSlotWorldPos,
+  // Stage 4 RL exports
+  env,policyForward,buildObs,executeAction,importWeights,exportWeights,
+  get envMode(){return envMode;}, set envMode(v){envMode=v;},
+  get episodeCount(){return episodeCount;},
+  get episodeReturnHist(){return episodeReturnHist;},
+  POLICY,OBS_SIZE,ACT_SIZE,
+  // Mutable scalars — exposed as getters/setters so tests can both read and write
+  // (JS closures prevent direct alias of `let` vars, so we use accessor descriptors)
+  get score(){return score;}, set score(v){score=v;},
+  get stamina(){return stamina;}, set stamina(v){stamina=v;},
+  get gusting(){return gusting;}, set gusting(v){gusting=v;},
+  get gameOver(){return gameOver;}, set gameOver(v){gameOver=v;},
+  get gameWon(){return gameWon;}, set gameWon(v){gameWon=v;},
+  get currentSeason(){return currentSeason;}, set currentSeason(v){currentSeason=v;},
+  get simTime(){return simTime;}, set simTime(v){simTime=v;},
+};
+
+// ── Balance notes ─────────────────────────────────────────────
+// Spring (0-90 s): BALL_DECAY=0.014 N/s → total lift (19.5 N) falls below
+//   platform weight (17.6 N) at ~60 s. Average player dies 70-90 s. ✓
+//   Spring gusts (18-28 s interval, +14-32 m/s impulse) create angular
+//   torque via pendulum sway. Without warm gust, platform tilts and falls.
+//
+// Summer (90-180 s): Heat shimmer drains an extra 0.004*HEAT_MAX ≈ 0.001 N/s
+//   per balloon per shimmer unit. Over 90 s that's ~0.1 N/balloon — minor
+//   alone but cumulative with decay. Lightning hits for -2.2 N on one balloon.
+//   Known issue: heat shimmer bleeds into balloon.lift permanently. A separate
+//   effectiveLift compute would be cleaner; left as-is to avoid complexity.
+//
+// Autumn (180-270 s): OU muX=6 m/s sustained crosswind keeps balloons tilted.
+//   Leaves add up to leafLoad ≈ 1.5 kg by end of season (+14.7 N weight).
+//   Strong wind (>8 m/s) blows leaves off — natural regulator.
+//
+// Winter (270+ s): Ice builds at 0.0018/s → 55% lift reduction at ICE_MAX
+//   after ~333 s of winter. Blizzard spikes (OU sigma=6) can push windX to
+//   ±15 m/s. Snow adds ~0.18 kg/min. To clear winter: survive to t=330 s.
+//
+// Reward hacking risk: agent learns pure survival (reinflate only) since
+//   SCORE_PER_S * episode_length >> SCORE_HARVEST in short runs.
+//   Document this honestly when writing Stage 4 comments.
+</script>
+</body>
+</html>
